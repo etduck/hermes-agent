@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 
 
@@ -79,3 +81,39 @@ def render_alarm(req: RenderRequest, authorization: str | None = Header(default=
     if not text:
         raise HTTPException(status_code=502, detail="Hermes returned empty text")
     return {"ok": True, "text": text[:500]}
+
+
+@app.post("/v1/audio/speech")
+async def proxy_tts_audio_speech(request: Request, authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing upstream authorization")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object body is required")
+    allowed = {"model", "input", "voice", "response_format", "speed", "instructions"}
+    payload = {k: v for k, v in payload.items() if k in allowed}
+    if not payload.get("model") or not payload.get("input") or not payload.get("voice"):
+        raise HTTPException(status_code=400, detail="model, input and voice are required")
+    upstream_base = os.getenv("AIHUBMIX_TTS_BASE", "https://aihubmix.com/v1").rstrip("/")
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(55, connect=10)) as client:
+            upstream = await client.post(
+                upstream_base + "/audio/speech",
+                headers={"Authorization": authorization, "Content-Type": "application/json"},
+                json=payload,
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="AIHubMix TTS timeout") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="AIHubMix TTS connection failed") from exc
+    content_type = upstream.headers.get("content-type", "application/octet-stream")
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=content_type.split(";", 1)[0],
+        headers={"X-GagaPhone-TTS-Proxy-Elapsed": f"{time.perf_counter() - started:.3f}"},
+    )
