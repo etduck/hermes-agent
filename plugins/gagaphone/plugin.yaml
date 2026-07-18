@@ -1,0 +1,16 @@
+name: gagaphone
+version: 1.0.0
+description: "GagaPhone unified alarm center tools. All alarms are stored and scheduled by GagaPhone; Hermes does not create cron jobs."
+author: GagaPhone
+kind: backend
+provides_tools:
+  - create_gagaphone_alarm
+  - list_gagaphone_alarms
+  - get_gagaphone_alarm
+  - update_gagaphone_alarm
+  - delete_gagaphone_alarm
+  - pause_gagaphone_alarm
+  - resume_gagaphone_alarm
+  - skip_next_gagaphone_alarm
+  - test_gagaphone_alarm
+  - broadcast_gagaphone_now
