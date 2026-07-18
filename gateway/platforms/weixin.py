@@ -56,6 +56,7 @@ except ImportError:  # pragma: no cover - dependency gate
     CRYPTO_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
+from gateway.gagaphone_alarm_fallback import handle_gagaphone_alarm_fallback
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1468,6 +1469,34 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
         if event.message_type == MessageType.TEXT:
+            try:
+                fallback_response = await asyncio.to_thread(
+                    handle_gagaphone_alarm_fallback,
+                    event.text or "",
+                    message_id=event.message_id,
+                    source_user=sender_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] GagaPhone static alarm fallback failed from=%s: %s",
+                    self.name,
+                    _safe_id(sender_id),
+                    exc,
+                )
+                fallback_response = None
+            if fallback_response:
+                logger.info("[%s] GagaPhone static alarm fallback handled message_id=%s", self.name, event.message_id)
+                if self._send_session and self._token:
+                    await _send_message(
+                        self._send_session,
+                        base_url=self._base_url,
+                        token=self._token,
+                        to=effective_chat_id,
+                        text=self.format_message(fallback_response),
+                        context_token=context_token or None,
+                        client_id=f"hermes-weixin-{uuid.uuid4().hex}",
+                    )
+                return
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)

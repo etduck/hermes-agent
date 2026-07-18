@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import requests
@@ -47,6 +49,33 @@ def _normalize_extension(value: str) -> str:
     return EXTENSION_ALIASES.get(raw, raw)
 
 
+def _coerce_delay_seconds(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0 or seconds > 366 * 24 * 3600:
+        return None
+    return seconds
+
+
+def _relative_run_at(args: dict[str, Any], timezone_name: str) -> str | None:
+    seconds = _coerce_delay_seconds(
+        args.get("delay_seconds")
+        or args.get("relative_delay_seconds")
+        or args.get("after_seconds")
+    )
+    if seconds is None:
+        return None
+    try:
+        tz = ZoneInfo(timezone_name or "Asia/Shanghai")
+    except Exception:
+        tz = ZoneInfo("Asia/Shanghai")
+    return (datetime.now(tz) + timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
+
+
 def _request(method: str, path: str, *, payload: dict | None = None, headers: dict | None = None) -> dict:
     if not _available():
         raise RuntimeError("GagaPhone API token or base URL is not configured")
@@ -80,15 +109,20 @@ def _alarm_summary(data: dict) -> dict:
 def _handle_create(args, **kw):
     try:
         target = _normalize_extension(args.get("target_extension") or args.get("target") or "")
+        timezone_name = args.get("timezone") or "Asia/Shanghai"
+        schedule_type = args.get("schedule_type") or "once"
+        run_at = args.get("run_at") or None
+        if schedule_type == "once" and not run_at:
+            run_at = _relative_run_at(args, timezone_name)
         payload = {
             "name": args.get("name") or "微信闹钟",
             "source": "hermes_wechat",
             "source_user": args.get("source_user") or "wechat",
             "target_extension": target,
-            "schedule_type": args.get("schedule_type") or "once",
-            "run_at": args.get("run_at") or None,
+            "schedule_type": schedule_type,
+            "run_at": run_at,
             "cron_expression": args.get("cron_expression") or "",
-            "timezone": args.get("timezone") or "Asia/Shanghai",
+            "timezone": timezone_name,
             "content_type": args.get("content_type") or "static",
             "static_text": args.get("static_text") or "",
             "dynamic_provider": "hermes" if (args.get("content_type") == "dynamic") else "",
@@ -193,7 +227,8 @@ ALARM_BASE_PROPS = {
     "name": {"type": "string", "description": "闹钟名称。"},
     "target_extension": {"type": "string", "description": "目标分机或别名：办公室电话=559，家里电话=1801，我的手机=551。"},
     "schedule_type": {"type": "string", "enum": ["once", "cron", "interval"], "description": "一次性用 once，重复规则用 cron，间隔秒数用 interval。"},
-    "run_at": {"type": "string", "description": "一次性闹钟的带时区 ISO 8601 时间，例如 2026-07-18T21:00:00+08:00。"},
+    "run_at": {"type": "string", "description": "一次性闹钟的带时区 ISO 8601 时间，例如 2026-07-18T21:00:00+08:00。如用户给出相对时间，也可以留空并填写 delay_seconds。"},
+    "delay_seconds": {"type": "integer", "description": "相对当前时间的延迟秒数；例如“两分钟后”填 120，“30分钟后”填 1800。用户给出相对时间时直接使用本字段，不要询问当前时间。"},
     "cron_expression": {"type": "string", "description": "cron 表达式，如每天 08:00 为 0 8 * * *；interval 时填秒数。"},
     "timezone": {"type": "string", "default": "Asia/Shanghai"},
     "content_type": {"type": "string", "enum": ["static", "dynamic"]},
@@ -206,7 +241,7 @@ ALARM_BASE_PROPS = {
 }
 
 SCHEMAS = {
-    "create_gagaphone_alarm": {"name": "create_gagaphone_alarm", "description": "在 GagaPhone 统一闹钟中心创建电话闹钟。Hermes 不创建 cron；所有调度都由 GagaPhone 执行。创建成功后回复名称、精确时间、时区、分机、是否重复、内容摘要和任务 ID。", "parameters": {"type": "object", "properties": ALARM_BASE_PROPS, "required": ["name", "target_extension", "schedule_type", "content_type"]}},
+    "create_gagaphone_alarm": {"name": "create_gagaphone_alarm", "description": "在 GagaPhone 统一闹钟中心创建电话闹钟。Hermes 不创建 cron；所有调度都由 GagaPhone 执行。若用户说“两分钟后/30分钟后”等相对时间，直接把 delay_seconds 传给本工具，不要要求用户提供当前时间。创建成功后回复名称、精确时间、时区、分机、是否重复、内容摘要和任务 ID。", "parameters": {"type": "object", "properties": ALARM_BASE_PROPS, "required": ["name", "target_extension", "schedule_type", "content_type"]}},
     "list_gagaphone_alarms": {"name": "list_gagaphone_alarms", "description": "查询 GagaPhone 当前所有未删除闹钟；可用 query 按名称或内容过滤。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}},
     "get_gagaphone_alarm": {"name": "get_gagaphone_alarm", "description": "按 GagaPhone 闹钟 ID 查询详情。", "parameters": {"type": "object", "properties": {"alarm_id": {"type": "integer"}}, "required": ["alarm_id"]}},
     "update_gagaphone_alarm": {"name": "update_gagaphone_alarm", "description": "修改 GagaPhone 闹钟。若描述匹配多个闹钟，先 list 返回候选，不要猜测。", "parameters": {"type": "object", "properties": {"alarm_id": {"type": "integer"}, **ALARM_BASE_PROPS}, "required": ["alarm_id"]}},
