@@ -4,6 +4,12 @@ description: "GagaPhone unified alarm center tools. All alarms are stored and sc
 author: GagaPhone
 kind: backend
 provides_tools:
+  - get_course_schedule_url
+  - import_courses
+  - cancel_course
+  - update_course
+  - create_course
+  - list_courses
   - create_gagaphone_alarm
   - list_gagaphone_alarms
   - get_gagaphone_alarm
