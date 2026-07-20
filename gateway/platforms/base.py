@@ -5006,6 +5006,47 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Weixin transcription results need a stricter delivery contract:
+                # a local transcript file means transcription_completed only. The
+                # final success notice is sent by the persistent outbox after every
+                # transcript file has a platform-accepted send result. This avoids
+                # the previous false-positive flow where text was delivered before
+                # the file send was attempted or checked.
+                if self.platform == Platform.WEIXIN:
+                    _candidate_transcript_files = [p for p, _is_voice in media_files] + list(local_files)
+                    if _candidate_transcript_files:
+                        try:
+                            from gateway.delivery_outbox import (
+                                deliver_weixin_transcription_files,
+                                is_transcription_delivery,
+                            )
+
+                            if is_transcription_delivery(_candidate_transcript_files, text_content):
+                                _source_message_id = getattr(event, "message_id", None) or getattr(event, "id", None)
+                                _outbox_result = await deliver_weixin_transcription_files(
+                                    self,
+                                    event.source.chat_id,
+                                    [str(p) for p in _candidate_transcript_files],
+                                    metadata=_final_thread_metadata,
+                                    source_message_id=str(_source_message_id) if _source_message_id else None,
+                                )
+                                _record_delivery(_outbox_result)
+                                if _outbox_result.success:
+                                    logger.info("[%s] transcription outbox delivery completed for %s", self.name, event.source.chat_id)
+                                else:
+                                    logger.warning("[%s] transcription outbox delivery failed for %s: %s", self.name, event.source.chat_id, _outbox_result.error)
+                                text_content = ""
+                                images = []
+                                media_files = []
+                                local_files = []
+                        except Exception as outbox_err:
+                            logger.error("[%s] transcription outbox delivery crashed: %s", self.name, outbox_err, exc_info=True)
+                            _record_delivery(SendResult(success=False, error=str(outbox_err)))
+                            text_content = ""
+                            images = []
+                            media_files = []
+                            local_files = []
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -5165,6 +5206,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
@@ -5177,17 +5219,20 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
+                        if not file_result.success:
+                            logger.warning("[%s] Failed to send local file (%s): %s", self.name, ext, file_result.error)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 

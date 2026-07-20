@@ -1297,6 +1297,15 @@ class WeixinAdapter(BasePlatformAdapter):
         self._mark_connected()
         _LIVE_ADAPTERS[self._token] = self
         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
+        try:
+            from gateway.delivery_outbox import recover_weixin_transcription_outbox
+
+            asyncio.create_task(
+                recover_weixin_transcription_outbox(self),
+                name="weixin-transcription-outbox-recover",
+            )
+        except Exception as exc:
+            logger.warning("[%s] delivery outbox recovery scheduling failed: %s", self.name, exc)
         if self._group_policy != "disabled":
             logger.warning(
                 "[%s] WEIXIN_GROUP_POLICY=%s is set, but QR-login connects an iLink bot "
@@ -1888,31 +1897,45 @@ class WeixinAdapter(BasePlatformAdapter):
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
-        async def _deliver_media(path: str, is_voice: bool = False) -> None:
+        async def _deliver_media(path: str, is_voice: bool = False) -> SendResult:
             ext = Path(path).suffix.lower()
             if is_voice or ext in _AUDIO_EXTS:
-                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
-            elif ext in _VIDEO_EXTS:
-                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
-            elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
-            else:
-                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                return await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+            if ext in _VIDEO_EXTS:
+                return await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+            if ext in _IMAGE_EXTS:
+                return await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+            return await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+
+        def _accepted(result: SendResult | None) -> bool:
+            if not result or not result.success:
+                return False
+            return bool(result.message_id or result.raw_response)
 
         try:
             # Deliver extracted MEDIA: attachments first.
             for media_path, is_voice in media_files:
                 try:
-                    await _deliver_media(media_path, is_voice)
+                    media_result = await _deliver_media(media_path, is_voice)
                 except Exception as exc:
                     logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+                    return SendResult(success=False, error=str(exc), retryable=True)
+                if not _accepted(media_result):
+                    error = media_result.error if media_result else "empty media send result"
+                    logger.warning("[%s] media delivery not accepted for %s: %s", self.name, media_path, error)
+                    return SendResult(success=False, error=error or "media delivery was not platform accepted", retryable=bool(media_result and media_result.retryable))
 
             # Deliver bare local file paths.
             for file_path in local_files:
                 try:
-                    await _deliver_media(file_path, is_voice=False)
+                    file_result = await _deliver_media(file_path, is_voice=False)
                 except Exception as exc:
                     logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+                    return SendResult(success=False, error=str(exc), retryable=True)
+                if not _accepted(file_result):
+                    error = file_result.error if file_result else "empty file send result"
+                    logger.warning("[%s] local file delivery not accepted for %s: %s", self.name, file_path, error)
+                    return SendResult(success=False, error=error or "file delivery was not platform accepted", retryable=bool(file_result and file_result.retryable))
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
