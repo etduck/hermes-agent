@@ -3571,15 +3571,20 @@ class BasePlatformAdapter(ABC):
         for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
             spans.append((m.start(), m.end()))
 
-        # Inline code: `...` but NOT backtick-quoted paths in MEDIA: tags
+        # Inline code: `...` but NOT MEDIA directives wrapped as inline code
+        # (e.g. `MEDIA:/tmp/report.pdf`) or backtick-quoted paths after MEDIA:
+        # (e.g. MEDIA:`/tmp/report.pdf`). Those are intended delivery tags and
+        # must remain visible to extract_media(); otherwise the later display
+        # cleanup strips them and the reply disappears.
         for m in re.finditer(r'`[^`\n]+`', content):
             start = m.start()
-            # Check if this is a backtick-quoted path after MEDIA:
+            inner = content[m.start() + 1:m.end() - 1]
+            if re.match(r'\s*MEDIA:\s*(?:~/|/|[A-Za-z]:[/\\])', inner, re.IGNORECASE):
+                continue
             prefix = content[max(0, start - 20):start]
             if re.search(r'MEDIA:\s*$', prefix):
-                continue  # This is a MEDIA path quote, not inline code
+                continue
             spans.append((start, m.end()))
-
         # Blockquote lines: > at line start
         for m in re.finditer(r'^>.*$', content, re.MULTILINE):
             spans.append((m.start(), m.end()))

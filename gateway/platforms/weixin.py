@@ -1158,6 +1158,8 @@ class WeixinAdapter(BasePlatformAdapter):
         self._poll_session: Optional[aiohttp.ClientSession] = None
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._outbox_recovery_task: Optional[asyncio.Task] = None
+        self._last_background_task_exception: Optional[str] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 
         self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
@@ -1297,15 +1299,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self._mark_connected()
         _LIVE_ADAPTERS[self._token] = self
         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
-        try:
-            from gateway.delivery_outbox import recover_weixin_transcription_outbox
-
-            asyncio.create_task(
-                recover_weixin_transcription_outbox(self),
-                name="weixin-transcription-outbox-recover",
-            )
-        except Exception as exc:
-            logger.warning("[%s] delivery outbox recovery scheduling failed: %s", self.name, exc)
+        self._start_outbox_recovery_task()
         if self._group_policy != "disabled":
             logger.warning(
                 "[%s] WEIXIN_GROUP_POLICY=%s is set, but QR-login connects an iLink bot "
@@ -1319,9 +1313,63 @@ class WeixinAdapter(BasePlatformAdapter):
             )
         return True
 
+    def _start_outbox_recovery_task(self) -> None:
+        existing = self._outbox_recovery_task
+        if existing is not None and not existing.done():
+            logger.info("[%s] delivery outbox recovery already running", self.name)
+            return
+        try:
+            from gateway.delivery_outbox import recover_weixin_transcription_outbox
+
+            task = asyncio.create_task(
+                recover_weixin_transcription_outbox(self),
+                name="weixin-transcription-outbox-recover",
+            )
+        except Exception as exc:
+            self._last_background_task_exception = str(exc)
+            logger.warning("[%s] delivery outbox recovery scheduling failed: %s", self.name, exc)
+            return
+        self._outbox_recovery_task = task
+
+        def _done(done_task: asyncio.Task) -> None:
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as callback_exc:
+                self._last_background_task_exception = str(callback_exc)
+                logger.exception("[%s] delivery outbox recovery callback failed", self.name)
+                return
+            if exc is not None:
+                self._last_background_task_exception = str(exc)
+                logger.error(
+                    "[%s] delivery outbox recovery task failed",
+                    self.name,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+            else:
+                logger.info("[%s] delivery outbox recovery task completed", self.name)
+
+        task.add_done_callback(_done)
+        logger.info(
+            "[%s] health weixin_connected=%s inbound_task_alive=%s outbox_recovery_alive=%s last_task_exception=%s",
+            self.name,
+            self.is_connected,
+            bool(self._poll_task and not self._poll_task.done()),
+            bool(self._outbox_recovery_task and not self._outbox_recovery_task.done()),
+            self._last_background_task_exception,
+        )
+
     async def disconnect(self) -> None:
         _LIVE_ADAPTERS.pop(self._token, None)
         self._running = False
+        if self._outbox_recovery_task and not self._outbox_recovery_task.done():
+            self._outbox_recovery_task.cancel()
+            try:
+                await self._outbox_recovery_task
+            except asyncio.CancelledError:
+                pass
+        self._outbox_recovery_task = None
         for task in self._pending_text_batch_tasks.values():
             if not task.done():
                 task.cancel()
@@ -2104,8 +2152,31 @@ class WeixinAdapter(BasePlatformAdapter):
             message_id = await self._send_file(chat_id, video_path, caption or "")
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
-            logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            # Some iLink deployments reject native video cards without a
+            # server-side thumbnail/playback metadata response. Retry as a
+            # regular file so the recipient still receives the MP4.
+            logger.warning(
+                "[%s] native video send failed to=%s; retrying as file: %s",
+                self.name,
+                _safe_id(chat_id),
+                exc,
+            )
+            try:
+                message_id = await self._send_file(
+                    chat_id,
+                    video_path,
+                    caption or "",
+                    force_file_attachment=True,
+                )
+                return SendResult(success=True, message_id=message_id)
+            except Exception as fallback_exc:
+                logger.error(
+                    "[%s] video file fallback failed to=%s: %s",
+                    self.name,
+                    _safe_id(chat_id),
+                    fallback_exc,
+                )
+                return SendResult(success=False, error=str(fallback_exc))
 
     async def send_voice(
         self,
@@ -2181,6 +2252,15 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         upload_param = str(upload_response.get("upload_param") or "")
         upload_full_url = str(upload_response.get("upload_full_url") or "")
+        logger.info(
+            "[%s] media upload target type=%s raw=%d encrypted=%d has_direct=%s has_param=%s",
+            self.name,
+            media_type,
+            rawsize,
+            _aes_padded_size(rawsize),
+            bool(upload_full_url),
+            bool(upload_param),
+        )
         ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
 
         # Prefer upload_full_url (direct CDN), fall back to constructed CDN URL
@@ -2265,7 +2345,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     "mid_size": kw["ciphertext_size"],
                 },
             }
-        if mime.startswith("video/"):
+        if mime.startswith("video/") and not force_file_attachment:
             return MEDIA_VIDEO, lambda **kw: {
                 "type": ITEM_VIDEO,
                 "video_item": {
